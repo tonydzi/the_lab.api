@@ -1718,21 +1718,42 @@ class ExperimentRunner:
                     await asyncio.get_event_loop().run_in_executor(
                         None, self._reconcile_stale_running, exp)
 
-            # Check store for any finished experiments we haven't returned yet.
-            # This catches results across server restarts and race conditions.
-            for status in ("completed", "failed"):
-                for exp in self._store.list_experiments_by_status(status):
-                    if exp["id"] in self._seen:
-                        continue
-                    if experiment_id is not None and exp["id"] != experiment_id:
-                        continue
-                    if idea_id is not None and exp.get("idea_id") != idea_id:
-                        continue
-                    self._seen.add(exp["id"])
+            # Waiting on ONE named experiment asks "what happened to this run?",
+            # so answer from its current state and bypass _seen entirely.
+            #
+            # _seen is process-global and pre-populated at startup with every
+            # already-finished experiment, and it is consumed destructively (the
+            # first waiter to observe a completion removes it from every other
+            # waiter's view). Consulting it here meant `the-lab wait <label>`
+            # blocked until timeout — with no output — whenever the experiment
+            # was already terminal: finished before this server started, or
+            # finished while the caller was away and claimed by another waiter.
+            # It also silently never reported "cancelled", which the scan below
+            # omits while startup marks it seen.
+            if experiment_id is not None:
+                exp = self._store.get_experiment(experiment_id)
+                if exp and exp.get("status") in ("completed", "failed", "cancelled"):
+                    # Deliberately not added to _seen: this response is scoped to
+                    # this caller, and claiming it would starve a global waiter.
                     return {
                         "event": exp["status"],
                         "experiment": exp,
                     }
+            else:
+                # Unfiltered / idea-scoped wait keeps "wake me on the next
+                # completion" semantics, where _seen is what stops the same
+                # result being returned over and over.
+                for status in ("completed", "failed", "cancelled"):
+                    for exp in self._store.list_experiments_by_status(status):
+                        if exp["id"] in self._seen:
+                            continue
+                        if idea_id is not None and exp.get("idea_id") != idea_id:
+                            continue
+                        self._seen.add(exp["id"])
+                        return {
+                            "event": exp["status"],
+                            "experiment": exp,
+                        }
 
             # Check for unread messages addressed to this agent — return early
             # so the caller can react. Same recipient resolution as the
