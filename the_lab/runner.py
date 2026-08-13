@@ -1738,8 +1738,29 @@ class ExperimentRunner:
             # so the caller can react. Same recipient resolution as the
             # notifications middleware.
             if agent_id or agent_role:
-                unread = messages_mod.unread_for(
-                    repo_dir, agent_id=agent_id, role=agent_role, limit=20,
+                # CLAIM on delivery rather than peek. "Unread" is a latch, not
+                # an edge: unread_for() is a pure read, so it stayed true until
+                # the agent explicitly read elsewhere and this wake re-fired on
+                # every call. A client that re-waits the moment /wait returns
+                # then spins as fast as the network allows — measured ~36 req/s
+                # from three pollers against one agent with 10 stale unread
+                # messages, which also floods the dashboard's activity feed.
+                #
+                # claim_unread_for() selects and marks read under one lock, the
+                # same contract the notifications middleware and the WS listener
+                # already use (N1 cross-channel dedup) — so a message delivered
+                # here is not re-delivered there, and vice versa.
+                # Role-only callers can't claim (no id for read_by); the /wait
+                # route only sets agent_role when agent_id resolved, so in
+                # practice this is always the claiming path.
+                unread = (
+                    messages_mod.claim_unread_for(
+                        repo_dir, agent_id=agent_id, role=agent_role, limit=20,
+                    )
+                    if agent_id
+                    else messages_mod.unread_for(
+                        repo_dir, agent_id=agent_id, role=agent_role, limit=20,
+                    )
                 )
                 if unread:
                     running = self._store.list_experiments_by_status("running")
