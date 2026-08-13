@@ -332,7 +332,30 @@ function mkState(id: string): AgentState {
   };
 }
 
+// Coalescing window for agentStates rebuilds triggered by the api_call trail.
+// Each rebuild reassigns the signal and re-renders the whole agent tree, and
+// api_call events are unbounded in rate: a client that re-waits the moment
+// /wait returns produced ~36 calls/s (pending + completion each), i.e. ~70
+// repaints/s, which reads as flicker — and the in-flight /wait row toggled on
+// and off with it. Collapsing bursts to ~5 repaints/s keeps the panel readable
+// without dropping any state: the tick always rebuilds from current data.
+const REBUILD_COALESCE_MS = 200;
+let _rebuildTimer: number | null = null;
+
+function scheduleAgentStatesRebuild(): void {
+  if (_rebuildTimer !== null) return;
+  _rebuildTimer = window.setTimeout(() => {
+    _rebuildTimer = null;
+    rebuildAgentStates(activityFeed.value);
+  }, REBUILD_COALESCE_MS);
+}
+
 function rebuildAgentStates(events: ActivityEvent[]): void {
+  // A pending rebuild is now redundant — this call supersedes it.
+  if (_rebuildTimer !== null) {
+    window.clearTimeout(_rebuildTimer);
+    _rebuildTimer = null;
+  }
   const now = Date.now();
   // A pending long-poll that never saw its completion (socket drop, agent
   // gone) shouldn't spin forever — expire after 15min.
@@ -436,7 +459,8 @@ export function startAgentActivity(): void {
           _apiByAgent[aid] = [call, ...(_apiByAgent[aid] ?? [])].slice(0, API_KEEP);
         }
         work(aid, call.ts);   // own action — counts toward "thinking"
-        rebuildAgentStates(activityFeed.value);
+        // Coalesced: this is the one unbounded-rate event type.
+        scheduleAgentStatesRebuild();
       }
       return;
     }
