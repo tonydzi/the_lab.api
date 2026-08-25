@@ -793,16 +793,35 @@ def cmd_wait():
 
     exp = result.get("experiment") or {}
     status = exp.get("status") or result.get("status") or result.get("event", "unknown")
+    terminal = status in ("completed", "failed", "cancelled")
     out = {
-        "status":     status,
-        "label":      exp.get("label") or exp.get("id") or exp_id,
-        "metrics":    exp.get("metrics"),
-        "error":      exp.get("error"),
-        "runtime":    exp.get("runtime"),
-        "finished_at": exp.get("finished_at"),
+        "status": status,
+        "label":  exp.get("label") or exp.get("id") or exp_id,
+        # Explicit so a retry loop never has to infer terminality from prose.
+        "done":   terminal,
     }
+    # Null-valued keys are omitted. An always-present '"error": null' made naive
+    # matchers loop forever: a retry wrapper globbing the payload for *error*
+    # matched every successful result, so its wait never exited and one shell
+    # per experiment accumulated for days.
+    for key, value in (
+        ("metrics", exp.get("metrics")),
+        ("error", exp.get("error")),
+        ("runtime", exp.get("runtime")),
+        ("finished_at", exp.get("finished_at")),
+    ):
+        if value is not None:
+            out[key] = value
+    if status == "message":
+        out["messages"] = len(result.get("messages") or [])
     print(_json.dumps(out))
-    sys.exit(0 if status == "completed" else 1)
+    # Exit codes are the contract for retry loops — do not parse the text:
+    #   0 = completed             (terminal, success)
+    #   1 = failed / cancelled    (terminal, no point retrying)
+    #   2 = not finished yet      (timeout or messages arrived — wait again)
+    # Previously timeout also exited 1, indistinguishable from a real failure,
+    # which is what pushed callers into substring-matching the JSON.
+    sys.exit(0 if status == "completed" else (1 if terminal else 2))
 
 
 # ---------------------------------------------------------------------------
