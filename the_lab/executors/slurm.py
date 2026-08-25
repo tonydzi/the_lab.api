@@ -42,6 +42,7 @@ executor_config keys
 from __future__ import annotations
 
 import logging
+import shlex
 import subprocess
 import tempfile
 from pathlib import Path
@@ -53,6 +54,14 @@ class SlurmExecutor:
     DEFAULT_SLURM_CONF = "/data/slurm/etc/slurm.conf"
 
     def __init__(self, ssh_host: str, config: dict, instance_id: str | None = None):
+        # Re-validate at construction, not just at the API boundary. Values that
+        # reach here from a hand-edited .the_lab/queue.json, or a resource
+        # written before ingress validation existed, get spliced into remote
+        # command strings the same way — and ssh hands those to the remote
+        # user's shell. Fail loudly at dispatch rather than executing them.
+        from ..queue import _validate_executor_config
+        _validate_executor_config({**(config or {}), "ssh_host": ssh_host})
+
         self.ssh_host    = ssh_host
         self.instance_id = instance_id or ""
         self.partition   = config.get("partition",  "lowprio")
@@ -85,7 +94,12 @@ class SlurmExecutor:
 
     def _ssh(self, cmd: str, check: bool = True) -> subprocess.CompletedProcess:
         """Run cmd on the remote host via SSH, with SLURM_CONF prefixed."""
-        full_cmd = f"SLURM_CONF={self.slurm_conf} {cmd}"
+        # shlex.quote the config-derived value: ssh runs this string through
+        # the remote user's shell, so an unquoted "…conf; <anything>" would
+        # execute <anything> there. Validated at ingress too
+        # (queue._validate_executor_config) — quoted here so a resource written
+        # by an older version, or loaded straight off disk, is still safe.
+        full_cmd = f"SLURM_CONF={shlex.quote(self.slurm_conf)} {cmd}"
         result = subprocess.run(
             ["ssh", self.ssh_host, full_cmd],
             capture_output=True, text=True,
@@ -185,9 +199,10 @@ class SlurmExecutor:
         safety net when the remote is a non-bare repo with a branch checked out.
         """
         abs_path = self._resolve_git_repo_path()
+        q_path = shlex.quote(abs_path)
         self._ssh_plain(
-            f"git init --bare {abs_path} -q 2>/dev/null || true && "
-            f"git -C {abs_path} config receive.denyCurrentBranch ignore"
+            f"git init --bare {q_path} -q 2>/dev/null || true && "
+            f"git -C {q_path} config receive.denyCurrentBranch ignore"
         )
         self._resolved_bare_path: str = abs_path  # type: ignore[attr-defined]
         return abs_path
@@ -380,7 +395,7 @@ _PREEMPTED=0
 _lab_requeue() {{
     _PREEMPTED=1
     curl -s -X POST "$THE_LAB_API_URL/experiments/{label}/requeue" \\
-         -H "Authorization: Basic $THE_LAB_AUTH" \\
+         -H "Authorization: Bearer $THE_LAB_TOKEN" \\
          -H "Content-Type: application/json" \\
          -d '{{"reason":"preempted"}}' || true
 }}
@@ -459,7 +474,7 @@ if [ $_PREEMPTED -eq 0 ]; then
     fi
 
     curl -s -X POST "$THE_LAB_API_URL/experiments/{label}/slurm_done" \\
-         -H "Authorization: Basic $THE_LAB_AUTH" \\
+         -H "Authorization: Bearer $THE_LAB_TOKEN" \\
          -H "Content-Type: application/json" \\
          -d "{{\\"exit_code\\":$_EXIT}}" || true
 fi

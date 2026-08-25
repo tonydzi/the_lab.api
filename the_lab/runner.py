@@ -132,6 +132,31 @@ def _parse_log_progress(lines: list[str]) -> dict | None:
     }
 
 
+# Experiment wall-clock bounds (seconds). A caller-supplied timeout is capped at
+# THE_LAB_MAX_EXPERIMENT_TIMEOUT; a caller that supplies none gets
+# THE_LAB_DEFAULT_EXPERIMENT_TIMEOUT. Set either to 0 to disable that bound.
+def _env_seconds(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+DEFAULT_EXPERIMENT_TIMEOUT = _env_seconds("THE_LAB_DEFAULT_EXPERIMENT_TIMEOUT", 24 * 3600)
+MAX_EXPERIMENT_TIMEOUT = _env_seconds("THE_LAB_MAX_EXPERIMENT_TIMEOUT", 7 * 24 * 3600)
+
+
+def _clamp_experiment_timeout(requested: float | None) -> float | None:
+    """Apply the default/maximum wall-clock bounds to a requested timeout."""
+    if requested is None or requested <= 0:
+        requested = DEFAULT_EXPERIMENT_TIMEOUT
+    if requested <= 0:
+        return None            # default bound disabled by the operator
+    if MAX_EXPERIMENT_TIMEOUT > 0:
+        return min(requested, MAX_EXPERIMENT_TIMEOUT)
+    return requested
+
+
 class ExperimentRunner:
     def __init__(self, store: Store, read_only: bool = False):
         self._store = store
@@ -481,6 +506,13 @@ class ExperimentRunner:
                 start_timeout = float(meta_timeout) if meta_timeout is not None else None
             except (TypeError, ValueError):
                 start_timeout = None
+            # A run with no timeout held its resource units forever, so one
+            # wedged experiment could stall the queue indefinitely. Apply a
+            # default deadline when the caller didn't set one, and cap what a
+            # caller may ask for. Both are env-overridable for long training
+            # jobs; 0 / negative disables (explicitly opting back in to the old
+            # unbounded behaviour).
+            start_timeout = _clamp_experiment_timeout(start_timeout)
 
             try:
                 if resource.kind == "slurm":
@@ -1012,16 +1044,21 @@ class ExperimentRunner:
         env_extra: dict[str, str],
     ) -> dict:
         """Submit an experiment to Slurm via SSH and start monitoring."""
-        import base64
         from .executors.slurm import SlurmExecutor
 
         ssh_host = resource.executor_config.get("ssh_host", "slurm")
         executor = SlurmExecutor(ssh_host, resource.executor_config, instance_id=self._store.instance_id)
 
         # Build env dict that the wrapper script will expose to the experiment
-        lab_user = os.environ.get("THE_LAB_USER", "")
-        lab_password = os.environ.get("THE_LAB_PASSWORD", "")
-        lab_auth = base64.b64encode(f"{lab_user}:{lab_password}".encode()).decode()
+        # The admin Basic credential is deliberately NOT computed or embedded
+        # here. The generated wrapper runs on a remote compute node and curls
+        # back to callback_url — which comes from caller-supplied
+        # executor_config — so anything the wrapper carries can be aimed at an
+        # attacker's listener. Review demonstrated exactly that: the real
+        # admin credential arriving at a controlled endpoint. Every callback in
+        # the wrapper now authenticates with the per-run bearer token instead,
+        # which is scoped, unregistered when the run ends, and useless for the
+        # admin-only routes (see app._ADMIN_ONLY_ROUTES).
 
         # The callback URL must be reachable from the *compute node*, not just
         # localhost.  Priority order:
@@ -1093,7 +1130,6 @@ class ExperimentRunner:
         wrapper_env = {
             "THE_LAB_TOKEN":   run_token,
             "THE_LAB_API_URL": lab_api_url,
-            "THE_LAB_AUTH":    lab_auth,
             "THE_LAB_EXP_ID":  str(exp["id"]),
             "THE_LAB_IDEA_ID": str(exp.get("idea_id", "")),
             **{k: str(v) for k, v in env_extra.items()},
