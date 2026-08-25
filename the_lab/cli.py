@@ -484,6 +484,24 @@ def _apply_log_filters() -> None:
           "(THE_LAB_QUIET_INVALID_HTTP)", file=sys.stderr)
 
 
+def _is_loopback_host(host: str) -> bool:
+    """True when *host* only accepts connections from this machine.
+
+    Anything else (0.0.0.0, ::, a LAN/public address) is reachable off-box and
+    so must not be served without authentication.
+    """
+    import ipaddress
+
+    h = (host or "").strip().strip("[]")
+    if h in ("localhost", "localhost.localdomain"):
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        # A hostname we can't classify — treat as non-loopback (fail closed).
+        return False
+
+
 def _find_dashboard_dir() -> Path | None:
     """Find the dashboard/ source directory (for Vite dev server)."""
     # Check relative to the package
@@ -1377,7 +1395,18 @@ def main():
         default=".",
         help="Path to the git repository to manage experiments in (default: current directory)",
     )
-    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to (default: 0.0.0.0)")
+    # Loopback by default: this server runs agent-submitted shell scripts, moves
+    # git branches and (with a Slurm resource) SSHes to a cluster. Binding it to
+    # every interface out of the box meant an unauthenticated box on a shared or
+    # cloud-reachable network exposed all of that. Widening is now explicit.
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="Host to bind to (default: 127.0.0.1). Binding a "
+                             "non-loopback address requires auth (THE_LAB_USER + "
+                             "THE_LAB_PASSWORD) or --insecure-public.")
+    parser.add_argument("--insecure-public", action="store_true",
+                        help="Allow binding a non-loopback address with no "
+                             "authentication configured. Every route becomes "
+                             "world-writable — only for a trusted private network.")
     parser.add_argument("--port", type=int, default=8000, help="Port to bind to (default: 8000)")
     parser.add_argument("--dev", action="store_true", help="Development mode: auto-reload on code changes, hold requests during restart")
     parser.add_argument("--demo", action="store_true",
@@ -1454,10 +1483,32 @@ def main():
     # Announce auth status so operators know whether the UI is open.
     _auth_user = os.environ.get("THE_LAB_USER", "").strip()
     _auth_pass = os.environ.get("THE_LAB_PASSWORD", "").strip()
-    if _auth_user and _auth_pass:
+    _auth_on = bool(_auth_user and _auth_pass)
+    if _auth_on:
         print(f"[auth] HTTP Basic Auth enabled (user: {_auth_user})", file=sys.stderr)
     else:
         print("[auth] No authentication — set THE_LAB_USER + THE_LAB_PASSWORD to enable", file=sys.stderr)
+
+    # Fail closed: never expose an unauthenticated server beyond loopback unless
+    # the operator says so in as many words. Refusing to start is deliberately
+    # louder than a warning nobody reads in a scrollback buffer.
+    if not _is_loopback_host(args.host) and not _auth_on and not args.insecure_public:
+        print(
+            f"\n[auth] refusing to bind {args.host} with no authentication.\n"
+            "  This server runs agent-submitted shell scripts and can reach your\n"
+            "  git repo and any configured Slurm cluster. Unauthenticated on a\n"
+            "  non-loopback address means anyone who can route to this port can\n"
+            "  do all of that.\n\n"
+            "  Pick one:\n"
+            "    THE_LAB_USER=<user> THE_LAB_PASSWORD=<pass> the-lab .   # add auth\n"
+            "    the-lab .                                              # loopback only\n"
+            "    the-lab . --host " + args.host + " --insecure-public    # trusted private net\n",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if not _is_loopback_host(args.host) and not _auth_on:
+        print(f"[auth] WARNING: {args.host} is exposed with NO authentication "
+              f"(--insecure-public)", file=sys.stderr)
 
     # Auto-build dashboard if sources changed
     dashboard_dir = _find_dashboard_dir()

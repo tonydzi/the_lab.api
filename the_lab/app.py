@@ -5,6 +5,7 @@ import base64
 import json as _json
 import logging
 import os
+import re
 import secrets
 import threading
 import time as _time_mod
@@ -295,6 +296,50 @@ async def demo_gate(request: Request, call_next):
     return await call_next(request)
 
 
+# Routes an experiment/agent bearer token must never reach — the operational
+# and secret-bearing surface. Keyed by normalized path pattern; value is the set
+# of methods that are admin-only ("*" = every method).
+#
+# A denylist (rather than an allowlist of permitted routes) is deliberate: a
+# project's .the_lab/preamble.sh may legitimately call any read route, and
+# breaking those silently would be worse than the residual risk here. Everything
+# demonstrated as exploitable in review is covered.
+_ADMIN_ONLY_ROUTES: dict[str, set[str]] = {
+    "/api/v1/prompts/{}":            {"PUT", "DELETE"},   # instruction injection into future agents
+    "/api/v1/sandbox":               {"PUT"},             # widening the sandbox mount allowlist
+    "/api/v1/stats":                 {"GET"},             # replay buffer leaks captured request bodies
+    "/api/v1/stats/import":          {"*"},
+    "/api/v1/resources/{}":          {"PUT", "DELETE"},   # defines the SSH/Slurm command target
+    "/api/v1/queue/config":          {"PUT"},
+    "/api/v1/queue/pause":           {"*"},
+    "/api/v1/queue/resume":          {"*"},
+    "/api/v1/task":                  {"PUT"},
+    "/api/v1/config/metric-directions": {"*"},
+    "/api/v1/chat":                  {"*"},               # spends the operator's Anthropic key
+}
+
+
+def _admin_route_key(path: str) -> str:
+    """Collapse a concrete path to its _ADMIN_ONLY_ROUTES key.
+
+    Only the final path segment is templated, which is enough for the
+    single-parameter routes in the table (``/prompts/<role>``,
+    ``/resources/<name>``) without pulling in the router's own matcher.
+    """
+    p = "/" + path.strip("/")
+    if p in _ADMIN_ONLY_ROUTES:
+        return p
+    head, _, _tail = p.rpartition("/")
+    return f"{head}/{{}}" if head else p
+
+
+def _is_admin_only(method: str, path: str) -> bool:
+    methods = _ADMIN_ONLY_ROUTES.get(_admin_route_key(path))
+    if not methods:
+        return False
+    return "*" in methods or method.upper() in methods
+
+
 @app.middleware("http")
 async def basic_auth(request: Request, call_next):
     """HTTP Basic Auth gate. Active only when THE_LAB_USER + THE_LAB_PASSWORD are set.
@@ -303,6 +348,10 @@ async def basic_auth(request: Request, call_next):
     after the auth dialog has been accepted. Every other path — including
     the SPA root and all /api/v1/ routes — requires a valid credential.
     """
+    # Default tier. With auth disabled there is no gate to distinguish callers,
+    # so everything is "admin" — which is exactly why an unauthenticated
+    # non-loopback bind is now refused in cli.py.
+    request.state.auth_tier = "admin"
     if not _AUTH_ENABLED:
         return await call_next(request)
     # Static assets are fetched by the browser after the page is authenticated;
@@ -317,12 +366,31 @@ async def basic_auth(request: Request, call_next):
     if auth_header.startswith("Basic "):
         provided = auth_header[len("Basic "):].strip()
         if secrets.compare_digest(provided, _AUTH_EXPECTED):
+            request.state.auth_tier = "admin"
             return await call_next(request)
     # Also accept Bearer tokens issued by the runner for experiment processes.
     # This lets preamble/scripts call the API without needing admin credentials.
+    #
+    # These tokens are NOT admin-equivalent. They are handed to agent-authored
+    # experiment code, so anything they can reach is reachable by a single
+    # misbehaving experiment: a red-team pass used one ordinary experiment's
+    # token to rewrite a role's system prompt (poisoning every later agent
+    # session), to read a plaintext sandbox-disable password back out of the
+    # stats replay buffer, and to widen the sandbox mount allowlist. The
+    # operational surface below is therefore admin-only (Basic auth).
     if auth_header.startswith("Bearer "):
         token = auth_header[len("Bearer "):].strip()
         if _token_registry.is_valid(token):
+            if _is_admin_only(request.method, request.url.path):
+                return Response(
+                    content=(
+                        "Forbidden: this route requires admin credentials. "
+                        "Experiment/agent bearer tokens are scoped to experiment "
+                        "reporting and cannot reach operational routes."
+                    ),
+                    status_code=403,
+                )
+            request.state.auth_tier = "experiment"
             return await call_next(request)
     return Response(
         content="Unauthorized",
@@ -358,18 +426,48 @@ async def resolve_agent(request, call_next):
     return await call_next(request)
 
 
+# Body fields whose VALUES must never reach the stats replay buffer.
+_SECRET_BODY_FIELDS = (
+    "disable_password", "password", "passwd", "secret", "token",
+    "api_key", "apikey", "authorization", "credential", "private_key",
+)
+
+# "field": "value"  /  "field": 123  — tolerant of whitespace and quote style.
+_SECRET_FIELD_RE = re.compile(
+    r'("(?:' + "|".join(_SECRET_BODY_FIELDS) + r')"\s*:\s*)'
+    r'("(?:[^"\\]|\\.)*"|[^,}\s]+)',
+    re.IGNORECASE,
+)
+
+
+def _redact_secrets(body: str) -> str:
+    """Replace secret-ish JSON field values with a placeholder.
+
+    Operates on the raw text rather than parsed JSON so it still redacts a
+    truncated or malformed body — the capture is a debugging aid, and a partial
+    body is exactly where a naive parse would give up and store the secret.
+    """
+    if not body:
+        return body
+    return _SECRET_FIELD_RE.sub(r'\1"[REDACTED]"', body)
+
+
 @app.middleware("http")
 async def track_api_stats(request, call_next):
     import time as _time
 
-    # Capture body preview for POST/PUT before passing to handler
+    # Capture body preview for POST/PUT before passing to handler.
+    # Bodies land in a replay buffer that GET /api/v1/stats serves back, so any
+    # secret in a request body became readable by every caller with a token —
+    # review read a plaintext sandbox disable_password out of it. Redact the
+    # known-sensitive fields before storing.
     body_preview = ""
     body_bytes = 0
     if request.method in ("POST", "PUT") and request.url.path.startswith("/api/v1/"):
         try:
             raw = await request.body()
             body_bytes = len(raw)
-            body_preview = raw.decode(errors="replace")[:200]
+            body_preview = _redact_secrets(raw.decode(errors="replace"))[:200]
         except Exception:
             pass
     t0 = _time.perf_counter()
