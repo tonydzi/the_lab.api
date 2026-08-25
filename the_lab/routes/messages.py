@@ -64,6 +64,16 @@ async def send_message(req: MessageRequest, request: Request):
     return msg
 
 
+def _is_operator(request: Request) -> bool:
+    """True when the caller is the operator (dashboard/CLI), not an agent.
+
+    Admin tier is set by the auth gate: Basic credentials, or auth disabled
+    entirely. An experiment bearer token is tier "experiment" and does not
+    qualify, so a single experiment cannot dump the whole message log.
+    """
+    return getattr(request.state, "auth_tier", "admin") == "admin"
+
+
 @router.get("/api/v1/messages")
 def list_messages(
     request: Request,
@@ -103,8 +113,29 @@ def list_messages(
         msgs = [m for m in all_msgs if messages_mod.is_for(m, agent_id=agent_id, role=role)]
         total = len(msgs)
         page = msgs[offset: offset + limit]
-    else:
+    elif agent_id or role:
+        # Identified caller, no explicit filter: scope to what this identity can
+        # legitimately see — messages addressed to it, plus its own sent ones.
+        # The unfiltered branch below used to run for EVERY caller, so a request
+        # with no headers at all returned every message in the store (review
+        # read a private DM between two other agents anonymously).
+        all_msgs, _ = messages_mod.list_messages(REPO_DIR, limit=None)
+        msgs = [
+            m for m in all_msgs
+            if messages_mod.is_for(m, agent_id=agent_id, role=role)
+            or (agent_id and m.get("from_agent") == agent_id)
+        ]
+        total = len(msgs)
+        page = msgs[offset: offset + limit]
+    elif _is_operator(request):
+        # The dashboard/operator view legitimately shows the whole message log.
         page, total = messages_mod.list_messages(REPO_DIR, limit=limit, offset=offset)
+    else:
+        raise HTTPException(
+            403,
+            "identify yourself with X-Agent-Id to read messages "
+            "(the full message log is operator-only).",
+        )
 
     # The agent has now been shown these messages' full text, so mark its own
     # inbox items read (unless explicitly peeking). This is what keeps read
