@@ -26,12 +26,15 @@ O(1) instead of O(I×E) filesystem scans.
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import jsonio
+
+logger = logging.getLogger(__name__)
 
 
 def _now() -> str:
@@ -413,12 +416,26 @@ class Store:
     # global ID (e.g. "400.671") which is fine.
 
     def _next_seq(self, idea_id: int) -> int:
-        """Next per-idea seq number: max existing stem + 1, or 1."""
-        existing = self._exp_by_idea.get(idea_id, set())
-        if not existing:
-            return 1
-        max_seq = max(self._experiments[lbl]["seq"] for lbl in existing
-                      if lbl in self._experiments)
+        """Next per-idea seq number: max existing stem + 1, or 1.
+
+        Caller must hold ``self._lock``.
+
+        The seq is parsed from the LABEL rather than looked up in
+        ``self._experiments``, so a label reserved by an in-flight
+        create_experiment (registered in ``_exp_by_idea`` before its record is
+        written) still counts. Reading the record dict instead would skip
+        reservations and hand the same seq to a concurrent create.
+        """
+        max_seq = 0
+        for label in self._exp_by_idea.get(idea_id, set()):
+            _, _, tail = str(label).rpartition(".")
+            try:
+                max_seq = max(max_seq, int(tail))
+            except ValueError:
+                # Not an idea.seq label — fall back to the stored record.
+                rec = self._experiments.get(label)
+                if rec and isinstance(rec.get("seq"), int):
+                    max_seq = max(max_seq, rec["seq"])
         return max_seq + 1
 
     def resolve_experiment(self, ref: str) -> dict | None:
@@ -438,16 +455,41 @@ class Store:
                     return e
         return None
 
+    # Meta keys the SERVER owns. A client that can set these is choosing paths
+    # the server later deletes (see delete_experiment) or claiming git state it
+    # does not control. Stripped at write time — filtering them only on read
+    # (deps._INTERNAL_META_KEYS) hid them from responses while leaving the
+    # stored values live.
+    _SERVER_OWNED_META_KEYS = frozenset({"outdir", "worktree", "git_branch", "git_commit"})
+
     def create_experiment(
         self,
         idea_id: int,
         description: str,
         meta: dict | None = None,
         tags: list[str] | None = None,
+        trusted_meta: bool = False,
     ) -> dict:
+        """Create an experiment record.
+
+        ``meta`` is client-supplied by default and has server-owned keys removed.
+        Internal callers that legitimately set those keys (e.g. the runner
+        recording the worktree it just created) pass ``trusted_meta=True``.
+        """
+        meta = dict(meta or {})
+        if not trusted_meta:
+            for key in self._SERVER_OWNED_META_KEYS:
+                meta.pop(key, None)
+        # Allocate the seq AND publish the label under one lock acquisition.
+        # _next_seq derives from self._exp_by_idea, so releasing the lock before
+        # registering the label left a window where a concurrent create for the
+        # same idea computed the same seq and silently clobbered the first one's
+        # record and script. Reserving here (rather than holding the lock across
+        # the disk write below) closes the window without serialising file I/O.
         with self._lock:
             seq = self._next_seq(idea_id)
-        label = f"{idea_id}.{seq}"
+            label = f"{idea_id}.{seq}"
+            self._exp_by_idea.setdefault(idea_id, set()).add(label)
 
         script_rel = self._exp_script_rel(idea_id, seq, subfolder=True)
         exp = {
@@ -458,7 +500,7 @@ class Store:
             "description": description,
             "script": script_rel,
             "status": "pending",
-            "meta": meta or {},
+            "meta": meta,
             "metrics": None,
             "error": None,
             "pid": None,
@@ -469,9 +511,18 @@ class Store:
         }
 
         exp_dir = self._idea_dir(idea_id) / str(seq)
-        exp_dir.mkdir(parents=True, exist_ok=True)
-        _write_json(exp_dir / "experiment.json", exp)
-        # Update cache
+        try:
+            exp_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(exp_dir / "experiment.json", exp)
+        except Exception:
+            # Release the reservation so the label isn't permanently burnt (and
+            # so _next_seq doesn't skip it) when the write fails.
+            with self._lock:
+                labels = self._exp_by_idea.get(idea_id)
+                if labels is not None:
+                    labels.discard(label)
+            raise
+        # Publish the record itself; the label was already reserved above.
         with self._lock:
             self._experiments[label] = exp
             self._exp_by_idea.setdefault(idea_id, set()).add(label)
@@ -511,6 +562,33 @@ class Store:
                 self._version += 1
         return exp
 
+    def _safe_cleanup_path(self, value, *, key: str, label: str) -> Path | None:
+        """Resolve *value* and return it only if it sits inside the repo.
+
+        Refuses anything that escapes ``repo_dir`` (absolute paths elsewhere,
+        ``..`` traversal, or a symlink pointing out), and refuses the repo root
+        itself. Returns None — with a warning — when the path is rejected, so a
+        malformed record degrades to "skip this cleanup" rather than deleting
+        something it should not.
+        """
+        try:
+            candidate = Path(value).expanduser()
+            # strict=False: the path may already be gone, which is fine; we only
+            # need its canonical form to test containment.
+            resolved = candidate.resolve(strict=False)
+            root = self.repo_dir.resolve(strict=False)
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.warning("experiment %s: unusable meta.%s (%r): %s", label, key, value, exc)
+            return None
+        if resolved == root or root not in resolved.parents:
+            logger.warning(
+                "experiment %s: refusing to delete meta.%s=%r — resolves to %s, "
+                "outside the managed repo %s",
+                label, key, value, resolved, root,
+            )
+            return None
+        return resolved
+
     def delete_experiment(self, exp_ref) -> dict | None:
         label = str(exp_ref)
         exp = self._experiments.get(label)
@@ -538,13 +616,17 @@ class Store:
             idea_dir / f"{seq}.metrics.jsonl",
         ]
 
-        outdir = (exp.get("meta") or {}).get("outdir")
-        if outdir:
-            cleanup_paths.append(Path(outdir))
-
-        worktree = (exp.get("meta") or {}).get("worktree")
-        if worktree:
-            cleanup_paths.append(Path(worktree))
+        # meta-derived cleanup paths are only followed when they resolve INSIDE
+        # the repo. Belt-and-braces behind the write-time filter above: a record
+        # written by an older version (or any future path that reaches meta)
+        # must not be able to aim rmtree at an arbitrary directory.
+        for key in ("outdir", "worktree"):
+            value = (exp.get("meta") or {}).get(key)
+            if not value:
+                continue
+            safe = self._safe_cleanup_path(value, key=key, label=label)
+            if safe is not None:
+                cleanup_paths.append(safe)
 
         for path in cleanup_paths:
             try:
