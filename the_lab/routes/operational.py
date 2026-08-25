@@ -236,16 +236,34 @@ def update_sandbox_state(req: SandboxConfigRequest):
     if current.get("enabled") and not req.enabled:
         if not verify_disable_password(REPO_DIR, req.disable_password or ""):
             raise HTTPException(403, "Incorrect disable password")
-    config = save_sandbox_config(
-        REPO_DIR,
-        {
-            "enabled": req.enabled,
-            "allowlist": req.allowlist,
-            "denylist": req.denylist,
-            "file_rw": req.file_rw,
-            "file_ro": req.file_ro,
-        },
-    )
+    # Widening the FILE rules is the same category of risk as switching the
+    # sandbox off — a new file_rw entry hands agent-authored experiment code
+    # write access outside the repo, and the old code gated only the
+    # enabled->disabled transition. Adding paths therefore needs the same
+    # password. Removing paths (tightening) stays free.
+    if current.get("enabled"):
+        added = (set(req.file_rw or []) - set(current.get("file_rw") or [])) | \
+                (set(req.file_ro or []) - set(current.get("file_ro") or []))
+        if added and not verify_disable_password(REPO_DIR, req.disable_password or ""):
+            raise HTTPException(
+                403,
+                "Adding sandbox file rules requires the disable password "
+                f"(new entries: {sorted(added)}). Removing rules does not.",
+            )
+    try:
+        config = save_sandbox_config(
+            REPO_DIR,
+            {
+                "enabled": req.enabled,
+                "allowlist": req.allowlist,
+                "denylist": req.denylist,
+                "file_rw": req.file_rw,
+                "file_ro": req.file_ro,
+            },
+        )
+    except ValueError as exc:
+        # Rejected by the bind denylist (mounting /, a home dir, a system root).
+        raise HTTPException(400, str(exc))
     # When enabling, store the new disable password (required by convention from the UI).
     if req.enabled and req.disable_password:
         set_disable_password(REPO_DIR, req.disable_password)

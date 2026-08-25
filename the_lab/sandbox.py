@@ -548,6 +548,38 @@ def load_sandbox_config(repo_dir: Path) -> dict:
     return config
 
 
+# Paths a sandbox file rule must never mount. The sandbox exists to contain
+# agent-authored experiment code; a rule of "/" (or a home/system root) hands
+# that code the whole filesystem, which build_bwrap_args faithfully turns into a
+# real "--bind / /" argument. Nothing legitimate needs these, and the review
+# demonstrated setting them with no credential and no disable-password.
+_DENIED_BIND_PATHS = frozenset({
+    "/", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot",
+    "/dev", "/proc", "/sys", "/var", "/root", "/home", "/Users",
+})
+
+
+def _reject_dangerous_binds(abs_paths: list[str], field: str) -> None:
+    """Raise ValueError if any path is a denied filesystem root.
+
+    Compares canonical forms so "/", "//", "/.", "/etc/../", and a symlink to /
+    are all caught rather than just the literal string.
+    """
+    home = str(Path.home())
+    for raw in abs_paths:
+        try:
+            resolved = Path(raw).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            raise ValueError(f"sandbox {field}: unusable path {raw!r}")
+        as_str = str(resolved)
+        if as_str in _DENIED_BIND_PATHS or as_str == home:
+            raise ValueError(
+                f"sandbox {field}: refusing to bind {as_str!r} — mounting a "
+                "filesystem or home root would disable the isolation the "
+                "sandbox provides. Bind the specific paths the experiment needs."
+            )
+
+
 def save_sandbox_config(repo_dir: Path, payload: dict) -> dict:
     base = str(repo_dir)
     # Normalize to absolute first (resolves any relative inputs), then convert
@@ -555,6 +587,8 @@ def save_sandbox_config(repo_dir: Path, payload: dict) -> dict:
     # worktrees without editing.
     abs_rw = normalize_paths(payload.get("file_rw", []), base_dir=base)
     abs_ro = normalize_paths(payload.get("file_ro", []), base_dir=base)
+    _reject_dangerous_binds(abs_rw, "file_rw")
+    _reject_dangerous_binds(abs_ro, "file_ro")
     stored = {
         "enabled": bool(payload.get("enabled", True)),
         "allowlist": normalize_rules(payload.get("allowlist", [])),
