@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 
 from ..cache import cached_response
 from ..deps import (
+    sanitize_error,
     store,
     REPO_DIR,
     agent_cwd,
@@ -137,7 +138,7 @@ def create_idea(req: NewIdeaRequest, request: Request):
         return _new_idea_response(idea, similar=similar, checked_out=checked_out)
     except GitError as e:
         store.release_unused_idea_id(idea_id)
-        raise HTTPException(500, str(e))
+        raise HTTPException(500, sanitize_error(e))
 
 
 @router.post("/ideas/{idea_id}/checkout")
@@ -188,7 +189,7 @@ def checkout_idea_endpoint(idea_id: int, request: Request):
             "idea_description": idea["description"],
         }
     except GitError as e:
-        raise HTTPException(500, str(e))
+        raise HTTPException(500, sanitize_error(e))
 
 
 @router.get("/ideas")
@@ -896,4 +897,4 @@ def adopt_idea(idea_id: int, request: Request, req: AdoptRequest | None = None):
         result["checkout"] = checkout_result
         return result
     except GitError as e:
-        raise HTTPException(500, str(e))
+        raise HTTPException(500, sanitize_error(e))

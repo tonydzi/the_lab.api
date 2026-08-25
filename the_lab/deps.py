@@ -81,6 +81,30 @@ _INTERNAL_META_KEYS = {"git_branch", "git_commit", "worktree"}
 
 # --- Helper functions ---
 
+def sanitize_error(exc: BaseException | str) -> str:
+    """Error text with host filesystem layout redacted.
+
+    Exception strings from git/subprocess routinely embed absolute paths, and
+    several routes returned them verbatim to the caller — leaking the operator's
+    username, NFS mount layout and repo location. The message itself is useful
+    to an agent ("branch already exists", "index.lock present"), so rewrite the
+    paths rather than dropping the text: REPO_DIR becomes "<repo>" and the home
+    directory becomes "~".
+    """
+    text = str(exc)
+    try:
+        repo = str(REPO_DIR)
+        if repo and repo != "/":
+            text = text.replace(repo, "<repo>")
+        home = str(Path.home())
+        if home and home != "/":
+            text = text.replace(home, "~")
+    except Exception:
+        pass
+    return text
+
+
+
 def _description_short(desc: str | None, limit: int = 120) -> str:
     """First line of a description, truncated to *limit* chars with an ellipsis.
 

@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse
 
 from .. import jsonio
 from ..deps import (
+    sanitize_error,
     store,
     runner,
     REPO_DIR,
@@ -1472,7 +1473,7 @@ async def post_experiment_progress(exp_ref: str, request: Request):
         await loop.run_in_executor(
             None, lambda: jsonio.write_json(progress_path, body, indent=0))
     except OSError as exc:
-        raise HTTPException(500, f"could not write progress file: {exc}")
+        raise HTTPException(500, f"could not write progress file: {sanitize_error(exc)}")
     await loop.run_in_executor(None, _record_heartbeat, exp["script"])
 
     # Broadcast immediately — no rsync lag.
