@@ -5,6 +5,12 @@ Zero dependencies. Reads THE_LAB_API_URL from the environment (set by run_eval.p
 On startup, fetches the OpenAPI spec, builds MCP tool definitions, and proxies
 tool calls as HTTP requests to the Lab API.
 """
+# The bridge is launched with a bare ``python3`` from PATH, not the interpreter
+# the-lab is installed in. On macOS that is /usr/bin/python3 (3.9), where
+# ``list[str] | None`` in a signature raises TypeError at import time and the
+# agent silently gets no labapi tools. Postponed annotations keep it importable.
+from __future__ import annotations
+
 import base64 as _base64
 import hashlib as _hashlib
 import json
